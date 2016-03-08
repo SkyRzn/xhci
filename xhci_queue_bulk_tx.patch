@@ -1,8 +1,8 @@
 diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
-index 7cf6621..6553933 100644
+index 7cf6621..ee8eddc 100644
 --- a/drivers/usb/host/xhci-ring.c
 +++ b/drivers/usb/host/xhci-ring.c
-@@ -2938,39 +2938,52 @@ static int prepare_transfer(struct xhci_hcd *xhci,
+@@ -2938,46 +2938,55 @@ static int prepare_transfer(struct xhci_hcd *xhci,
  	return 0;
  }
  
@@ -19,12 +19,12 @@ index 7cf6621..6553933 100644
 +	return num_trbs;
 +}
 +
-+static unsigned int count_trbs_needed(struct urb *urb)
++static inline unsigned int count_trbs_needed(struct urb *urb)
 +{
 +	return count_trbs(urb->transfer_dma, urb->transfer_buffer_length);
 +}
 +
-+static unsigned int count_sg_trbs_needed(struct urb *urb)
++static inline unsigned int count_sg_trbs_needed(struct urb *urb)
  {
 -	int num_sgs, num_trbs, running_total, temp, i;
  	struct scatterlist *sg;
@@ -57,7 +57,7 @@ index 7cf6621..6553933 100644
 +	for_each_sg(urb->sg, sg, urb->num_mapped_sgs, i) {
 +		len = sg_dma_len(sg);
 +		num_trbs += count_trbs(sg_dma_address(sg), len);
-+		len = min_t(int, len, full_len); //FIXME нужна ли вообще эта проверка???
++		len = min_t(unsigned int, len, full_len); //FIXME нужна ли вообще эта проверка???
 +		full_len -= len;
 +		if (full_len == 0)
  			break;
@@ -66,8 +66,14 @@ index 7cf6621..6553933 100644
  	return num_trbs;
  }
  
-+static unsigned int count_isoc_trbs_needed(struct urb *urb, int i)
-+{
+-static void check_trb_math(struct urb *urb, int num_trbs, int running_total)
++static inline unsigned int count_isoc_trbs_needed(struct urb *urb, int i)
+ {
+-	if (num_trbs != 0)
+-		dev_err(&urb->dev->dev, "%s - ep %#x - Miscalculated number of "
+-				"TRBs, %d left\n", __func__,
+-				urb->ep->desc.bEndpointAddress, num_trbs);
+-	if (running_total != urb->transfer_buffer_length)
 +	u64 addr, td_len;
 +
 +	addr = (u64) (urb->transfer_dma + urb->iso_frame_desc[i].offset);
@@ -76,10 +82,13 @@ index 7cf6621..6553933 100644
 +	return count_trbs(addr, td_len);
 +}
 +
- static void check_trb_math(struct urb *urb, int num_trbs, int running_total)
- {
- 	if (num_trbs != 0)
-@@ -3086,35 +3099,35 @@ static u32 xhci_td_remainder(struct xhci_hcd *xhci, int transferred,
++static void check_trb_math(struct urb *urb, int running_total)
++{
++	if (unlikely(running_total != urb->transfer_buffer_length))
+ 		dev_err(&urb->dev->dev, "%s - ep %#x - Miscalculated tx length, "
+ 				"queued %#x (%d), asked for %#x (%d)\n",
+ 				__func__,
+@@ -3086,44 +3095,45 @@ static u32 xhci_td_remainder(struct xhci_hcd *xhci, int transferred,
  	return (total_packet_count - ((transferred + trb_buff_len) / maxp));
  }
  
@@ -122,7 +131,6 @@ index 7cf6621..6553933 100644
 -	num_sgs = urb->num_mapped_sgs;
 -	total_packet_count = DIV_ROUND_UP(urb->transfer_buffer_length,
 -			usb_endpoint_maxp(&urb->ep->desc));
-+
 +	if (urb->num_sgs) {
 +		num_sgs = urb->num_mapped_sgs;
 +		sg = urb->sg;
@@ -132,7 +140,10 @@ index 7cf6621..6553933 100644
  
  	ret = prepare_transfer(xhci, xhci->devs[slot_id],
  			ep_index, urb->stream_id,
-@@ -3124,6 +3137,8 @@ static int queue_bulk_sg_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+ 			num_trbs, urb, 0, mem_flags);
+-	if (ret < 0)
++	if (unlikely(ret < 0))
+ 		return ret;
  
  	urb_priv = urb->hcpriv;
  
@@ -141,7 +152,16 @@ index 7cf6621..6553933 100644
  	/* Deal with URB_ZERO_PACKET - need one more td/trb */
  	zero_length_needed = urb->transfer_flags & URB_ZERO_PACKET &&
  		urb_priv->length == 2;
-@@ -3148,227 +3163,54 @@ static int queue_bulk_sg_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+@@ -3133,7 +3143,7 @@ static int queue_bulk_sg_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+ 		ret = prepare_transfer(xhci, xhci->devs[slot_id],
+ 				ep_index, urb->stream_id,
+ 				1, urb, 1, mem_flags);
+-		if (ret < 0)
++		if (unlikely(ret < 0))
+ 			return ret;
+ 	}
+ 
+@@ -3148,227 +3158,54 @@ static int queue_bulk_sg_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
  	start_cycle = ep_ring->cycle_state;
  
  	running_total = 0;
@@ -169,7 +189,8 @@ index 7cf6621..6553933 100644
 -		u32 field = 0;
 -		u32 length_field = 0;
 -		u32 remainder = 0;
--
++	block_len = 0;
+ 
 -		/* Don't change the cycle bit of the first TRB until later */
 -		if (first_trb) {
 -			first_trb = false;
@@ -177,8 +198,7 @@ index 7cf6621..6553933 100644
 -				field |= 0x1;
 -		} else
 -			field |= ep_ring->cycle_state;
-+	block_len = 0;
- 
+-
 -		/* Chain all the TRBs together; clear the chain bit in the last
 -		 * TRB to indicate it's the last TRB in the chain.
 -		 */
@@ -251,7 +271,7 @@ index 7cf6621..6553933 100644
 +			}
 +			/* TRB buffer should not cross 64KB boundaries */
 +			trb_buff_len = TRB_BUFF_UP_TO_BOUNDARY_LEN(addr);
-+			trb_buff_len = min_t(int, trb_buff_len, block_len);
++			trb_buff_len = min_t(unsigned int, trb_buff_len, block_len);
  		} else {
 -			addr += trb_buff_len;
 +			/* Further through the continuous block FIXME*/
@@ -400,7 +420,14 @@ index 7cf6621..6553933 100644
  		}
  
  		/* Only set interrupt on short packet for IN endpoints */
-@@ -3384,7 +3226,7 @@ int xhci_queue_bulk_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+@@ -3378,13 +3215,13 @@ int xhci_queue_bulk_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+ 		/* Set the TRB length, TD size, and interrupter fields. */
+ 		remainder = xhci_td_remainder(xhci, running_total, trb_buff_len,
+ 					   urb->transfer_buffer_length,
+-					   urb, num_trbs - 1);
++					   urb, num_trbs - i - 1);
+ 
+ 		length_field = TRB_LEN(trb_buff_len) |
  			TRB_TD_SIZE(remainder) |
  			TRB_INTR_TARGET(0);
  
@@ -409,7 +436,7 @@ index 7cf6621..6553933 100644
  			more_trbs_coming = true;
  		else
  			more_trbs_coming = false;
-@@ -3392,16 +3234,22 @@ int xhci_queue_bulk_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+@@ -3392,18 +3229,24 @@ int xhci_queue_bulk_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
  				lower_32_bits(addr),
  				upper_32_bits(addr),
  				length_field,
@@ -438,9 +465,12 @@ index 7cf6621..6553933 100644
 +		}
 +	}
  
- 	check_trb_math(urb, num_trbs, running_total);
+-	check_trb_math(urb, num_trbs, running_total);
++	check_trb_math(urb, running_total);
  	giveback_first_trb(xhci, slot_id, ep_index, urb->stream_id,
-@@ -3532,23 +3380,6 @@ int xhci_queue_ctrl_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+ 			start_cycle, start_trb);
+ 	return 0;
+@@ -3532,23 +3375,6 @@ int xhci_queue_ctrl_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
  	return 0;
  }
  
@@ -464,7 +494,7 @@ index 7cf6621..6553933 100644
  /*
   * The transfer burst count field of the isochronous TRB defines the number of
   * bursts that are required to move all packets in this TD.  Only SuperSpeed
-@@ -3746,7 +3577,7 @@ static int xhci_queue_isoc_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+@@ -3746,7 +3572,7 @@ static int xhci_queue_isoc_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
  		last_burst_pkt_count = xhci_get_last_burst_packet_count(xhci,
  							urb, total_pkt_count);
  
@@ -473,7 +503,7 @@ index 7cf6621..6553933 100644
  
  		ret = prepare_transfer(xhci, xhci->devs[slot_id], ep_index,
  				urb->stream_id, trbs_per_td, urb, i, mem_flags);
-@@ -3807,8 +3638,7 @@ static int xhci_queue_isoc_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+@@ -3807,8 +3633,7 @@ static int xhci_queue_isoc_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
  					field |= TRB_BEI;
  			}
  			/* Calculate TRB length */
@@ -483,7 +513,7 @@ index 7cf6621..6553933 100644
  			if (trb_buff_len > td_remain_len)
  				trb_buff_len = td_remain_len;
  
-@@ -3912,7 +3742,7 @@ int xhci_queue_isoc_tx_prepare(struct xhci_hcd *xhci, gfp_t mem_flags,
+@@ -3912,7 +3737,7 @@ int xhci_queue_isoc_tx_prepare(struct xhci_hcd *xhci, gfp_t mem_flags,
  	num_trbs = 0;
  	num_tds = urb->number_of_packets;
  	for (i = 0; i < num_tds; i++)
