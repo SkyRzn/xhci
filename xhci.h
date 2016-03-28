@@ -1339,7 +1339,8 @@ union xhci_trb {
 #define TRB_MAX_BUFF_SHIFT		16
 #define TRB_MAX_BUFF_SIZE	(1 << TRB_MAX_BUFF_SHIFT)
 /* How much data is left before the 64KB boundary? */
-#define TRB_BUFF_UP_TO_BOUNDARY_LEN(addr)	(TRB_MAX_BUFF_SIZE - (addr & (TRB_MAX_BUFF_SIZE - 1)))
+#define TRB_BUFF_LEN_UP_TO_BOUNDARY(addr)	(TRB_MAX_BUFF_SIZE - \
+					(addr & (TRB_MAX_BUFF_SIZE - 1)))
 
 struct xhci_segment {
 	union xhci_trb		*trbs;

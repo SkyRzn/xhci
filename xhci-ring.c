@@ -2950,49 +2950,48 @@ static unsigned int count_trbs(u64 addr, u64 len)
 	return num_trbs;
 }
 
-static inline unsigned int count_trbs_needed(struct urb *urb, int td_index)
+static unsigned int count_trbs_needed(struct urb *urb, int td_index)
 {
-	u64 addr, len;
+	u32 len;
 
 	if (usb_endpoint_xfer_isoc(&urb->ep->desc)) {
+		u64 addr;
 		addr = (u64) (urb->transfer_dma + urb->iso_frame_desc[td_index].offset);
 		len = urb->iso_frame_desc[td_index].length;
 		return count_trbs(addr, len);
-	} else {
-		if (td_index == 1)
-			return 1;
-		if (urb->num_sgs) {
-			struct scatterlist *sg;
-			unsigned int i, full_len, num_trbs = 0;
+	}
 
-			full_len = urb->transfer_buffer_length;
+	if (urb->num_sgs) {
+		struct scatterlist *sg;
+		unsigned int i, num_trbs = 0;
+		u32 full_len = urb->transfer_buffer_length;
 
-			for_each_sg(urb->sg, sg, urb->num_mapped_sgs, i) {
-				len = sg_dma_len(sg);
-				num_trbs += count_trbs(sg_dma_address(sg), len);
-				len = min_t(unsigned int, len, full_len); //FIXME нужна ли вообще эта проверка???
-				full_len -= len;
-				if (full_len == 0)
-					break;
-			}
-
-			return num_trbs;
+		for_each_sg(urb->sg, sg, urb->num_mapped_sgs, i) {
+			len = sg_dma_len(sg);
+			num_trbs += count_trbs(sg_dma_address(sg), len);
+			len = min_t(u32, len, full_len); //FIXME нужна ли вообще эта проверка???
+			full_len -= len;
+			if (full_len == 0)
+				break;
 		}
+
+		return num_trbs;
 	}
 	return count_trbs(urb->transfer_dma, urb->transfer_buffer_length);
 }
 
-
-static void check_trb_math(struct urb *urb, int running_total)
+static int check_trb_math(struct urb *urb, unsigned int running_total, unsigned int td_len)
 {
-	if (unlikely(running_total != urb->transfer_buffer_length))
+	if (unlikely(running_total != td_len)) {
 		dev_err(&urb->dev->dev, "%s - ep %#x - Miscalculated tx length, "
 				"queued %#x (%d), asked for %#x (%d)\n",
 				__func__,
 				urb->ep->desc.bEndpointAddress,
 				running_total, running_total,
-				urb->transfer_buffer_length,
-				urb->transfer_buffer_length);
+				td_len, td_len);
+		return -EINVAL;
+	}
+	return 0;
 }
 
 static void giveback_first_trb(struct xhci_hcd *xhci, int slot_id,
@@ -3011,26 +3010,20 @@ static void giveback_first_trb(struct xhci_hcd *xhci, int slot_id,
 	xhci_ring_ep_doorbell(xhci, slot_id, ep_index, stream_id);
 }
 
-/*
- * xHCI uses normal TRBs for both bulk and interrupt.  When the interrupt
- * endpoint is to be serviced, the xHC will consume (at most) one TD.  A TD
- * (comprised of sg list entries) can take several service intervals to
- * transmit.
- */
-int xhci_queue_intr_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
-		struct urb *urb, int slot_id, unsigned int ep_index)
+static void check_interval(struct xhci_hcd *xhci, struct urb *urb,
+						struct xhci_ep_ctx *ep_ctx)
 {
-	struct xhci_ep_ctx *ep_ctx = xhci_get_ep_ctx(xhci,
-			xhci->devs[slot_id]->out_ctx, ep_index);
 	int xhci_interval;
 	int ep_interval;
 
 	xhci_interval = EP_INTERVAL_TO_UFRAMES(le32_to_cpu(ep_ctx->ep_info));
 	ep_interval = urb->interval;
+
 	/* Convert to microframes */
 	if (urb->dev->speed == USB_SPEED_LOW ||
 			urb->dev->speed == USB_SPEED_FULL)
 		ep_interval *= 8;
+
 	/* FIXME change this to a warning and a suggestion to use the new API
 	 * to set the polling interval (once the API is added).
 	 */
@@ -3045,6 +3038,22 @@ int xhci_queue_intr_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
 				urb->dev->speed == USB_SPEED_FULL)
 			urb->interval /= 8;
 	}
+}
+
+/*
+ * xHCI uses normal TRBs for both bulk and interrupt.  When the interrupt
+ * endpoint is to be serviced, the xHC will consume (at most) one TD.  A TD
+ * (comprised of sg list entries) can take several service intervals to
+ * transmit.
+ */
+int xhci_queue_intr_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+		struct urb *urb, int slot_id, unsigned int ep_index)
+{
+	struct xhci_ep_ctx *ep_ctx;
+
+	ep_ctx = xhci_get_ep_ctx(xhci, xhci->devs[slot_id]->out_ctx, ep_index);
+	check_interval(xhci, urb, ep_ctx);
+
 	return xhci_queue_bulk_tx(xhci, mem_flags, urb, slot_id, ep_index);
 }
 
@@ -3092,6 +3101,366 @@ static u32 xhci_td_remainder(struct xhci_hcd *xhci, int transferred,
 
 	/* Queueing functions don't count the current TRB into transferred */
 	return (total_packet_count - ((transferred + trb_buff_len) / maxp));
+}
+
+/*
+ * The transfer burst count field of the isochronous TRB defines the number of
+ * bursts that are required to move all packets in this TD.  Only SuperSpeed
+ * devices can burst up to bMaxBurst number of packets per service interval.
+ * This field is zero based, meaning a value of zero in the field means one
+ * burst.  Basically, for everything but SuperSpeed devices, this field will be
+ * zero.  Only xHCI 1.0 host controllers support this field.
+ */
+static unsigned int xhci_get_burst_count(struct xhci_hcd *xhci,
+										 struct urb *urb, unsigned int total_packet_count)
+{
+	unsigned int max_burst;
+
+	if (xhci->hci_version < 0x100 || urb->dev->speed < USB_SPEED_SUPER)
+		return 0;
+
+	max_burst = urb->ep->ss_ep_comp.bMaxBurst;
+	return DIV_ROUND_UP(total_packet_count, max_burst + 1) - 1;
+}
+
+/*
+ * Returns the number of packets in the last "burst" of packets.  This field is
+ * valid for all speeds of devices.  USB 2.0 devices can only do one "burst", so
+ * the last burst packet count is equal to the total number of packets in the
+ * TD.  SuperSpeed endpoints can have up to 3 bursts.  All but the last burst
+ * must contain (bMaxBurst + 1) number of packets, but the last burst can
+ * contain 1 to (bMaxBurst + 1) packets.
+ */
+static unsigned int xhci_get_last_burst_packet_count(struct xhci_hcd *xhci,
+													 struct urb *urb, unsigned int total_packet_count)
+{
+	unsigned int max_burst;
+	unsigned int residue;
+
+	if (xhci->hci_version < 0x100)
+		return 0;
+
+	if (urb->dev->speed >= USB_SPEED_SUPER) {
+		/* bMaxBurst is zero based: 0 means 1 packet per burst */
+		max_burst = urb->ep->ss_ep_comp.bMaxBurst;
+		residue = total_packet_count % (max_burst + 1);
+		/* If residue is zero, the last burst contains (max_burst + 1)
+		 * number of packets, but the TLBPC field is zero-based.
+		 */
+		if (residue == 0)
+			return max_burst;
+		return residue - 1;
+	}
+	if (total_packet_count == 0)
+		return 0;
+	return total_packet_count - 1;
+}
+
+/*
+ * Calculates Frame ID field of the isochronous TRB identifies the
+ * target frame that the Interval associated with this Isochronous
+ * Transfer Descriptor will start on. Refer to 4.11.2.5 in 1.1 spec.
+ *
+ * Returns actual frame id on success, negative value on error.
+ */
+static int xhci_get_isoc_frame_id(struct xhci_hcd *xhci,
+								  struct urb *urb, int index)
+{
+	int start_frame, ist, ret = 0;
+	int start_frame_id, end_frame_id, current_frame_id;
+
+	if (urb->dev->speed == USB_SPEED_LOW ||
+		urb->dev->speed == USB_SPEED_FULL)
+		start_frame = urb->start_frame + index * urb->interval;
+	else
+		start_frame = (urb->start_frame + index * urb->interval) >> 3;
+
+	/* Isochronous Scheduling Threshold (IST, bits 0~3 in HCSPARAMS2):
+	 *
+	 * If bit [3] of IST is cleared to '0', software can add a TRB no
+	 * later than IST[2:0] Microframes before that TRB is scheduled to
+	 * be executed.
+	 * If bit [3] of IST is set to '1', software can add a TRB no later
+	 * than IST[2:0] Frames before that TRB is scheduled to be executed.
+	 */
+	ist = HCS_IST(xhci->hcs_params2) & 0x7;
+	if (HCS_IST(xhci->hcs_params2) & (1 << 3))
+		ist <<= 3;
+
+	/* Software shall not schedule an Isoch TD with a Frame ID value that
+	 * is less than the Start Frame ID or greater than the End Frame ID,
+	 * where:
+	 *
+	 * End Frame ID = (Current MFINDEX register value + 895 ms.) MOD 2048
+	 * Start Frame ID = (Current MFINDEX register value + IST + 1) MOD 2048
+	 *
+	 * Both the End Frame ID and Start Frame ID values are calculated
+	 * in microframes. When software determines the valid Frame ID value;
+	 * The End Frame ID value should be rounded down to the nearest Frame
+	 * boundary, and the Start Frame ID value should be rounded up to the
+	 * nearest Frame boundary.
+	 */
+	current_frame_id = readl(&xhci->run_regs->microframe_index);
+	start_frame_id = roundup(current_frame_id + ist + 1, 8);
+	end_frame_id = rounddown(current_frame_id + 895 * 8, 8);
+
+	start_frame &= 0x7ff;
+	start_frame_id = (start_frame_id >> 3) & 0x7ff;
+	end_frame_id = (end_frame_id >> 3) & 0x7ff;
+
+	xhci_dbg(xhci, "%s: index %d, reg 0x%x start_frame_id 0x%x, end_frame_id 0x%x, start_frame 0x%x\n",
+			 __func__, index, readl(&xhci->run_regs->microframe_index),
+			 start_frame_id, end_frame_id, start_frame);
+
+	if (start_frame_id < end_frame_id) {
+		if (start_frame > end_frame_id ||
+			start_frame < start_frame_id)
+			ret = -EINVAL;
+	} else if (start_frame_id > end_frame_id) {
+		if ((start_frame > end_frame_id &&
+			start_frame < start_frame_id))
+			ret = -EINVAL;
+	} else {
+		ret = -EINVAL;
+	}
+
+	if (index == 0) {
+		if (ret == -EINVAL || start_frame == start_frame_id) {
+			start_frame = start_frame_id + 1;
+			if (urb->dev->speed == USB_SPEED_LOW ||
+				urb->dev->speed == USB_SPEED_FULL)
+				urb->start_frame = start_frame;
+			else
+				urb->start_frame = start_frame << 3;
+			ret = 0;
+		}
+	}
+
+	if (ret) {
+		xhci_warn(xhci, "Frame ID %d (reg %d, index %d) beyond range (%d, %d)\n",
+				  start_frame, current_frame_id, index,
+			start_frame_id, end_frame_id);
+		xhci_warn(xhci, "Ignore frame ID field, use SIA bit instead\n");
+		return ret;
+	}
+
+	return start_frame;
+}
+
+static void xhci_isoc_trb_field_fill(struct xhci_hcd *xhci, struct urb *urb,
+									 int td_index, u32 td_len, u32 *field, u32 *length_field)
+{
+	struct xhci_virt_ep *xep;
+	u32 sia_frame_id;
+	int frame_id;
+	unsigned int total_pkt_count, max_pkt;
+	unsigned int burst_count, last_burst_pkt_count;
+
+	xep = &xhci->devs[urb->dev->slot_id]->eps[xhci_get_endpoint_index(&urb->ep->desc)];
+
+	max_pkt = GET_MAX_PACKET(usb_endpoint_maxp(&urb->ep->desc));
+	total_pkt_count = DIV_ROUND_UP(td_len, max_pkt);
+
+	/* A zero-length transfer still involves at least one packet. */
+	if (total_pkt_count == 0)
+		total_pkt_count++;
+	burst_count = xhci_get_burst_count(xhci, urb, total_pkt_count);
+	last_burst_pkt_count = xhci_get_last_burst_packet_count(xhci,
+															urb, total_pkt_count);
+
+	/* use SIA as default, if frame id is used overwrite it */
+	sia_frame_id = TRB_SIA;
+	if (!(urb->transfer_flags & URB_ISO_ASAP) &&
+		HCC_CFC(xhci->hcc_params)) {
+		frame_id = xhci_get_isoc_frame_id(xhci, urb, td_index);
+	if (frame_id >= 0)
+		sia_frame_id = TRB_FRAME_ID(frame_id);
+		}
+
+		*field = TRB_TYPE(TRB_ISOC) |
+		TRB_TLBPC(last_burst_pkt_count) |
+		sia_frame_id;
+
+	/* xhci 1.1 with ETE uses TD_Size field for TBC, old is Rsvdz */
+	if (xep->use_extended_tbc)
+		*length_field = TRB_TD_SIZE_TBC(burst_count);
+	else
+		*field |= TRB_TBC(burst_count);
+}
+
+/* This is very similar to what ehci-q.c qtd_fill() does */
+static int queue_td(struct xhci_hcd *xhci, struct urb *urb, int td_index, u64 addr, u32 td_len, unsigned int num_trbs)
+{
+	struct xhci_ring *ep_ring;
+	struct xhci_td *td;
+	struct urb_priv *urb_priv;
+	struct scatterlist *sg = NULL;
+	bool more_trbs_coming;
+	unsigned int i, num_sgs = 0;
+	unsigned int running_total, block_len, trb_buff_len;
+	u32 field, length_field, remainder;
+
+	urb_priv = urb->hcpriv;
+	td = urb_priv->td[td_index];
+	ep_ring = xhci_urb_to_transfer_ring(xhci, urb);
+
+	/* If we have scatter/gather list, we use it. */
+	if (urb->num_sgs) {
+		sg = urb->sg;
+		num_sgs = urb->num_mapped_sgs;
+	}
+
+	running_total = 0;
+	block_len = 0;
+
+	/* Queue the TRBs, even if they are zero-length */
+	for (i = 0; i < num_trbs; i++) {
+		field = TRB_TYPE(TRB_NORMAL);
+
+		if (block_len == 0) {
+			/* A new contiguous block. */
+			if (sg) {
+				addr = (u64) sg_dma_address(sg);
+				block_len = sg_dma_len(sg);
+			} else
+				block_len = td_len;
+
+			/* TRB buffer should not cross 64KB boundaries */
+			trb_buff_len = TRB_BUFF_LEN_UP_TO_BOUNDARY(addr);
+			trb_buff_len = min_t(unsigned int, trb_buff_len, block_len);
+		} else {
+			/* Further through the contiguous block. */
+			trb_buff_len = block_len;
+			if (trb_buff_len > TRB_MAX_BUFF_SIZE)
+				trb_buff_len = TRB_MAX_BUFF_SIZE;
+		}
+
+		if (running_total + trb_buff_len > td_len)
+			trb_buff_len = td_len - running_total;
+
+		/* Set the TRB length, TD size, and interrupter fields. */
+		remainder = xhci_td_remainder(xhci, running_total,
+									  trb_buff_len, td_len,
+								urb, num_trbs - i - 1);
+
+		field = TRB_TYPE(TRB_NORMAL);
+		length_field = TRB_TD_SIZE(remainder);
+
+		if (i == 0 && usb_endpoint_xfer_isoc(&urb->ep->desc))
+			xhci_isoc_trb_field_fill(xhci, urb, td_index, td_len, &field, &length_field); //FIXME заменил ep на urb->ep
+
+		length_field |= TRB_LEN(trb_buff_len) | TRB_INTR_TARGET(0);
+
+		/* Don't change the cycle bit of the first TRB until later */
+		if (i == 0 && td_index == 0) {
+			if (ep_ring->cycle_state == 0)
+				field |= TRB_CYCLE;
+		} else
+			field |= ep_ring->cycle_state;
+
+		/* Only set interrupt on short packet for IN endpoints */
+		if (usb_urb_dir_in(urb))
+			field |= TRB_ISP;
+
+		/* Chain all the TRBs together; clear the chain bit in the last
+		 * TRB to indicate it's the last TRB in the chain.
+		 */
+		if (i < num_trbs - 1) {
+			more_trbs_coming = true;
+			field |= TRB_CHAIN;
+		} else {
+			more_trbs_coming = false;
+			field |= TRB_IOC;
+			td->last_trb = ep_ring->enqueue;
+
+			if (usb_endpoint_xfer_isoc(&urb->ep->desc)) {
+				/* set BEI, except for the last TD */
+				if (xhci->hci_version >= 0x100 &&
+					!(xhci->quirks & XHCI_AVOID_BEI) &&
+					td_index < urb->number_of_packets - 1)
+					field |= TRB_BEI;
+			}
+		}
+
+		queue_trb(xhci, ep_ring, more_trbs_coming,
+				lower_32_bits(addr),
+				upper_32_bits(addr),
+				length_field,
+				field);
+
+		running_total += trb_buff_len;
+		addr += trb_buff_len;
+		block_len -= trb_buff_len;
+
+		if (sg) {
+			if (block_len == 0) {
+				/* New sg entry */
+				--num_sgs;
+				if (num_sgs == 0)
+					break;
+				sg = sg_next(sg);
+			}
+		}
+	}
+
+	return check_trb_math(urb, running_total, td_len);
+}
+
+/* This is very similar to what ehci-q.c qtd_fill() does */
+int xhci_queue_bulk_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
+					   struct urb *urb, int slot_id, unsigned int ep_index)
+{
+	struct xhci_ring *ep_ring;
+	struct urb_priv *urb_priv;
+	struct xhci_generic_trb *start_trb;
+	bool zero_length_needed;
+	unsigned int start_cycle, num_trbs;
+	int ret;
+
+	ep_ring = xhci_urb_to_transfer_ring(xhci, urb);
+	if (!ep_ring)
+		return -EINVAL;
+
+	/* If we have scatter/gather list, we use it. */
+	num_trbs = count_trbs_needed(urb, 0);
+
+	ret = prepare_transfer(xhci, xhci->devs[slot_id],
+						   ep_index, urb->stream_id,
+						num_trbs, urb, 0, mem_flags);
+	if (unlikely(ret < 0))
+		return ret;
+
+	urb_priv = urb->hcpriv;
+
+	/* Deal with URB_ZERO_PACKET - need one more td/trb */
+	zero_length_needed = urb->transfer_flags & URB_ZERO_PACKET &&
+						urb_priv->length == 2;
+	if (zero_length_needed) {
+		xhci_dbg(xhci, "Creating zero length td.\n");
+		ret = prepare_transfer(xhci, xhci->devs[slot_id],
+								ep_index, urb->stream_id,
+								1, urb, 1, mem_flags);
+		if (unlikely(ret < 0))
+			return ret;
+	}
+
+	/*
+	 * Don't give the first TRB to the hardware (by toggling the cycle bit)
+	 * until we've finished creating all the other TRBs.  The ring's cycle
+	 * state may change as we enqueue the other TRBs, so save it too.
+	 */
+	start_trb = &ep_ring->enqueue->generic;
+	start_cycle = ep_ring->cycle_state;
+
+	queue_td(xhci, urb, 0, urb->transfer_dma, urb->transfer_buffer_length, num_trbs);
+
+	if (zero_length_needed) {
+		queue_td(xhci, urb, 1, urb->transfer_dma, 0, num_trbs);
+	}
+	giveback_first_trb(xhci, slot_id, ep_index, urb->stream_id,
+					   start_cycle, start_trb);
+
+	return ret;
 }
 
 /* Caller must have locked xhci->lock */
@@ -3217,375 +3586,17 @@ int xhci_queue_ctrl_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
 	return 0;
 }
 
-/*
- * The transfer burst count field of the isochronous TRB defines the number of
- * bursts that are required to move all packets in this TD.  Only SuperSpeed
- * devices can burst up to bMaxBurst number of packets per service interval.
- * This field is zero based, meaning a value of zero in the field means one
- * burst.  Basically, for everything but SuperSpeed devices, this field will be
- * zero.  Only xHCI 1.0 host controllers support this field.
- */
-static unsigned int xhci_get_burst_count(struct xhci_hcd *xhci,
-		struct urb *urb, unsigned int total_packet_count)
-{
-	unsigned int max_burst;
-
-	if (xhci->hci_version < 0x100 || urb->dev->speed < USB_SPEED_SUPER)
-		return 0;
-
-	max_burst = urb->ep->ss_ep_comp.bMaxBurst;
-	return DIV_ROUND_UP(total_packet_count, max_burst + 1) - 1;
-}
-
-/*
- * Returns the number of packets in the last "burst" of packets.  This field is
- * valid for all speeds of devices.  USB 2.0 devices can only do one "burst", so
- * the last burst packet count is equal to the total number of packets in the
- * TD.  SuperSpeed endpoints can have up to 3 bursts.  All but the last burst
- * must contain (bMaxBurst + 1) number of packets, but the last burst can
- * contain 1 to (bMaxBurst + 1) packets.
- */
-static unsigned int xhci_get_last_burst_packet_count(struct xhci_hcd *xhci,
-		struct urb *urb, unsigned int total_packet_count)
-{
-	unsigned int max_burst;
-	unsigned int residue;
-
-	if (xhci->hci_version < 0x100)
-		return 0;
-
-	if (urb->dev->speed >= USB_SPEED_SUPER) {
-		/* bMaxBurst is zero based: 0 means 1 packet per burst */
-		max_burst = urb->ep->ss_ep_comp.bMaxBurst;
-		residue = total_packet_count % (max_burst + 1);
-		/* If residue is zero, the last burst contains (max_burst + 1)
-		 * number of packets, but the TLBPC field is zero-based.
-		 */
-		if (residue == 0)
-			return max_burst;
-		return residue - 1;
-	}
-	if (total_packet_count == 0)
-		return 0;
-	return total_packet_count - 1;
-}
-
-/*
- * Calculates Frame ID field of the isochronous TRB identifies the
- * target frame that the Interval associated with this Isochronous
- * Transfer Descriptor will start on. Refer to 4.11.2.5 in 1.1 spec.
- *
- * Returns actual frame id on success, negative value on error.
- */
-static int xhci_get_isoc_frame_id(struct xhci_hcd *xhci,
-		struct urb *urb, int index)
-{
-	int start_frame, ist, ret = 0;
-	int start_frame_id, end_frame_id, current_frame_id;
-
-	if (urb->dev->speed == USB_SPEED_LOW ||
-			urb->dev->speed == USB_SPEED_FULL)
-		start_frame = urb->start_frame + index * urb->interval;
-	else
-		start_frame = (urb->start_frame + index * urb->interval) >> 3;
-
-	/* Isochronous Scheduling Threshold (IST, bits 0~3 in HCSPARAMS2):
-	 *
-	 * If bit [3] of IST is cleared to '0', software can add a TRB no
-	 * later than IST[2:0] Microframes before that TRB is scheduled to
-	 * be executed.
-	 * If bit [3] of IST is set to '1', software can add a TRB no later
-	 * than IST[2:0] Frames before that TRB is scheduled to be executed.
-	 */
-	ist = HCS_IST(xhci->hcs_params2) & 0x7;
-	if (HCS_IST(xhci->hcs_params2) & (1 << 3))
-		ist <<= 3;
-
-	/* Software shall not schedule an Isoch TD with a Frame ID value that
-	 * is less than the Start Frame ID or greater than the End Frame ID,
-	 * where:
-	 *
-	 * End Frame ID = (Current MFINDEX register value + 895 ms.) MOD 2048
-	 * Start Frame ID = (Current MFINDEX register value + IST + 1) MOD 2048
-	 *
-	 * Both the End Frame ID and Start Frame ID values are calculated
-	 * in microframes. When software determines the valid Frame ID value;
-	 * The End Frame ID value should be rounded down to the nearest Frame
-	 * boundary, and the Start Frame ID value should be rounded up to the
-	 * nearest Frame boundary.
-	 */
-	current_frame_id = readl(&xhci->run_regs->microframe_index);
-	start_frame_id = roundup(current_frame_id + ist + 1, 8);
-	end_frame_id = rounddown(current_frame_id + 895 * 8, 8);
-
-	start_frame &= 0x7ff;
-	start_frame_id = (start_frame_id >> 3) & 0x7ff;
-	end_frame_id = (end_frame_id >> 3) & 0x7ff;
-
-	xhci_dbg(xhci, "%s: index %d, reg 0x%x start_frame_id 0x%x, end_frame_id 0x%x, start_frame 0x%x\n",
-		 __func__, index, readl(&xhci->run_regs->microframe_index),
-		 start_frame_id, end_frame_id, start_frame);
-
-	if (start_frame_id < end_frame_id) {
-		if (start_frame > end_frame_id ||
-				start_frame < start_frame_id)
-			ret = -EINVAL;
-	} else if (start_frame_id > end_frame_id) {
-		if ((start_frame > end_frame_id &&
-				start_frame < start_frame_id))
-			ret = -EINVAL;
-	} else {
-			ret = -EINVAL;
-	}
-
-	if (index == 0) {
-		if (ret == -EINVAL || start_frame == start_frame_id) {
-			start_frame = start_frame_id + 1;
-			if (urb->dev->speed == USB_SPEED_LOW ||
-					urb->dev->speed == USB_SPEED_FULL)
-				urb->start_frame = start_frame;
-			else
-				urb->start_frame = start_frame << 3;
-			ret = 0;
-		}
-	}
-
-	if (ret) {
-		xhci_warn(xhci, "Frame ID %d (reg %d, index %d) beyond range (%d, %d)\n",
-				start_frame, current_frame_id, index,
-				start_frame_id, end_frame_id);
-		xhci_warn(xhci, "Ignore frame ID field, use SIA bit instead\n");
-		return ret;
-	}
-
-	return start_frame;
-}
-
-static void xhci_isoc_trb_field(struct xhci_hcd *xhci, struct urb *urb,
-							   struct xhci_virt_ep *ep, int td_index,
-							   u32 td_len, u32 *field, u32 *length_field)
-{
-	u32 sia_frame_id;
-	int frame_id;
-	unsigned int total_pkt_count, max_pkt;
-	unsigned int burst_count, last_burst_pkt_count;
-
-	max_pkt = GET_MAX_PACKET(usb_endpoint_maxp(&urb->ep->desc));
-	total_pkt_count = DIV_ROUND_UP(td_len, max_pkt);
-
-	/* A zero-length transfer still involves at least one packet. */
-	if (total_pkt_count == 0)
-		total_pkt_count++;
-	burst_count = xhci_get_burst_count(xhci, urb, total_pkt_count);
-	last_burst_pkt_count = xhci_get_last_burst_packet_count(xhci,
-															urb, total_pkt_count);
-
-	/* use SIA as default, if frame id is used overwrite it */
-	sia_frame_id = TRB_SIA;
-	if (!(urb->transfer_flags & URB_ISO_ASAP) &&
-		HCC_CFC(xhci->hcc_params)) {
-		frame_id = xhci_get_isoc_frame_id(xhci, urb, td_index);
-		if (frame_id >= 0)
-		sia_frame_id = TRB_FRAME_ID(frame_id);
-	}
-
-	*field = TRB_TYPE(TRB_ISOC) |
-			TRB_TLBPC(last_burst_pkt_count) |
-			sia_frame_id;
-
-	/* xhci 1.1 with ETE uses TD_Size field for TBC, old is Rsvdz */
-	if (ep->use_extended_tbc)
-		*length_field = TRB_TD_SIZE_TBC(burst_count);
-	else
-		*field |= TRB_TBC(burst_count);
-}
-
-/*
- * td_index == 0 для bulk
- * sg == NULL для isoc
- */
-static int xhci_queue_td(struct xhci_hcd *xhci, gfp_t mem_flags, struct urb *urb,
-						 int slot_id, unsigned int ep_index, int td_index,
-						 u64 addr, u32 td_len)
-{
-	struct xhci_ring *ep_ring;
-	struct urb_priv *urb_priv;
-	struct xhci_virt_ep *ep;
-	struct scatterlist *sg = NULL;
-	int i, ret, start_cycle;
-	unsigned int running_total, block_len, trb_buff_len;
-	unsigned int num_sgs, num_trbs;
-	u32 field, length_field;
-	u32 remainder;
-	bool more_trbs_coming;
-
-	ep = &xhci->devs[slot_id]->eps[ep_index];
-
-	if (urb->num_sgs) {
-		sg = urb->sg;
-		num_sgs = urb->num_mapped_sgs;
-	}
-
-	num_trbs = count_trbs_needed(urb, td_index);
-
-	urb_priv = urb->hcpriv;
-
-	ep_ring = xhci_urb_to_transfer_ring(xhci, urb);
-	if (!ep_ring)
-		return -EINVAL;
-
-	ret = prepare_transfer(xhci, xhci->devs[slot_id], ep_index,
-						   urb->stream_id, num_trbs, urb, td_index, mem_flags);
-
-	if (unlikely(ret < 0))
-		return ret;
-
-	running_total = 0;
-	block_len = 0;
-
-	for (i = 0; i < num_trbs; i++) {
-		if (block_len == 0) {
-			/* A new continuous block FIXME*/
-			if (sg) {
-				addr = (u64) sg_dma_address(sg);
-				block_len = sg_dma_len(sg);
-			} else
-				block_len = td_len;
-
-			/* TRB buffer should not cross 64KB boundaries */
-			trb_buff_len = TRB_BUFF_UP_TO_BOUNDARY_LEN(addr);
-			trb_buff_len = min_t(unsigned int, trb_buff_len, block_len);
-		} else {
-			/* Further through the continuous block FIXME*/
-			trb_buff_len = block_len;
-			if (trb_buff_len > TRB_MAX_BUFF_SIZE)
-				trb_buff_len = TRB_MAX_BUFF_SIZE;
-		}
-
-		if (running_total + trb_buff_len > urb->transfer_buffer_length) //FIXME what for isoc?
-			trb_buff_len = urb->transfer_buffer_length - running_total;
-
-		/* Set the TRB length, TD size, and interrupter fields. */
-		remainder = xhci_td_remainder(xhci, running_total, trb_buff_len,
-									  td_len, urb, num_trbs - i - 1);
-
-		field = TRB_TYPE(TRB_NORMAL);
-		length_field = TRB_TD_SIZE(remainder);
-
-		if (i == 0 && usb_endpoint_xfer_isoc(&urb->ep->desc))
-			xhci_isoc_trb_field(xhci, urb, ep, td_index, td_len, &field, &length_field);
-
-		length_field |= TRB_LEN(trb_buff_len) | TRB_INTR_TARGET(0);
-
-		start_cycle = ep_ring->cycle_state;
-		if (i > 0 || td_index > 0)
-			start_cycle = !start_cycle;
-		field |= start_cycle;
-
-		/* Only set interrupt on short packet for IN EPs */
-		if (usb_urb_dir_in(urb))
-			field |= TRB_ISP;
-
-		/* Chain all the TRBs together; clear the chain bit in the last
-		 * TRB to indicate it's the last TRB in the chain.
-		 */
-		if (i < num_trbs - 1) {
-			more_trbs_coming = true;
-			field |= TRB_CHAIN;
-		} else {
-			more_trbs_coming = false;
-			field |= TRB_IOC;
-			urb_priv->td[td_index]->last_trb = ep_ring->enqueue;
-
-			if (usb_endpoint_xfer_isoc(&urb->ep->desc)) {
-				/* set BEI, except for the last TD */
-				if (xhci->hci_version >= 0x100 &&
-					!(xhci->quirks & XHCI_AVOID_BEI) &&
-					i < urb->number_of_packets - 1)
-					field |= TRB_BEI;
-			}
-		}
-
-		queue_trb(xhci, ep_ring, more_trbs_coming,
-					lower_32_bits(addr),
-					upper_32_bits(addr),
-					length_field,
-					field);
-
-		running_total += trb_buff_len;
-		addr += trb_buff_len;
-		block_len -= trb_buff_len;
-
-		if (sg) {
-			/* Are we done queueing all the TRBs for this sg entry? */
-			if (block_len == 0) {
-				--num_sgs;
-				if (num_sgs == 0)
-					break;
-				sg = sg_next(sg);
-			}
-		}
-
-	}
-	check_trb_math(urb, running_total); //FIXME it is only for bulk
-	return 0;
-}
-
-/* This is very similar to what ehci-q.c qtd_fill() does */
-int xhci_queue_bulk_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
-					   struct urb *urb, int slot_id, unsigned int ep_index)
-{
-	struct xhci_ring *ep_ring;
-	struct xhci_generic_trb *start_trb;
-	struct urb_priv *urb_priv;
-	unsigned int start_cycle;
-	int ret;
-
-	ep_ring = xhci_urb_to_transfer_ring(xhci, urb);
-	if (!ep_ring)
-		return -EINVAL;
-
-	urb_priv = urb->hcpriv;
-
-	/*
-	 * Don't give the first TRB to the hardware (by toggling the cycle bit)
-	 * until we've finished creating all the other TRBs.  The ring's cycle
-	 * state may change as we enqueue the other TRBs, so save it too.
-	 */
-	start_trb = &ep_ring->enqueue->generic;
-	start_cycle = ep_ring->cycle_state;
-
-	xhci_queue_td(xhci, mem_flags, urb, slot_id, ep_index,
-				  0, urb->transfer_dma, urb->transfer_buffer_length);
-
-	/* Deal with URB_ZERO_PACKET - need one more td */
-	if (urb->transfer_flags & URB_ZERO_PACKET &&
-		urb_priv->length == 2) {
-		xhci_dbg(xhci, "Creating zero length td.\n");
-		xhci_queue_td(xhci, mem_flags, urb, slot_id, ep_index,
-					  1, 0, 0);
-		if (unlikely(ret < 0))
-			return ret;
-	}
-
-	giveback_first_trb(xhci, slot_id, ep_index, urb->stream_id,
-					   start_cycle, start_trb);
-	return 0;
-}
-
-
 /* This is for isoc transfer */
 static int xhci_queue_isoc_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
 		struct urb *urb, int slot_id, unsigned int ep_index)
 {
 	struct xhci_ring *ep_ring;
 	struct urb_priv *urb_priv;
-	int num_tds;
+	int num_tds, trbs_per_td;
 	struct xhci_generic_trb *start_trb;
 	int start_cycle;
-	int td_len, ret;
+	int i, td_len, ret;
 	u64 start_addr, addr;
-	int i;
 	struct xhci_virt_ep *xep;
 
 	xep = &xhci->devs[slot_id]->eps[ep_index];
@@ -3605,22 +3616,20 @@ static int xhci_queue_isoc_tx(struct xhci_hcd *xhci, gfp_t mem_flags,
 	for (i = 0; i < num_tds; i++) {
 		addr = start_addr + urb->iso_frame_desc[i].offset;
 		td_len = urb->iso_frame_desc[i].length;
-// 		td_remain_len = td_len; FIXME разобраться зачем оно
 
-		ret = xhci_queue_td(xhci, mem_flags, urb, slot_id, ep_index,
-							i, addr, td_len);
+		trbs_per_td = count_trbs_needed(urb, i);
+
+		ret = prepare_transfer(xhci, xhci->devs[slot_id], ep_index,
+				urb->stream_id, trbs_per_td, urb, i, mem_flags);
 		if (ret < 0) {
 			if (i == 0)
 				return ret;
 			goto cleanup;
 		}
 
-		/* Check TD length */
-// 		if (running_total != td_len) { FIXME перенести проверку, если нужна
-// 			xhci_err(xhci, "ISOC TD length unmatch\n");
-// 			ret = -EINVAL;
-// 			goto cleanup;
-// 		}
+		ret = queue_td(xhci, urb, i, addr, td_len, trbs_per_td);
+		if (ret)
+			goto cleanup;
 	}
 
 	/* store the next frame id */
@@ -3674,8 +3683,6 @@ int xhci_queue_isoc_tx_prepare(struct xhci_hcd *xhci, gfp_t mem_flags,
 	struct xhci_ring *ep_ring;
 	struct xhci_ep_ctx *ep_ctx;
 	int start_frame;
-	int xhci_interval;
-	int ep_interval;
 	int num_tds, num_trbs, i;
 	int ret;
 	struct xhci_virt_ep *xep;
@@ -3703,26 +3710,7 @@ int xhci_queue_isoc_tx_prepare(struct xhci_hcd *xhci, gfp_t mem_flags,
 	 * Check interval value. This should be done before we start to
 	 * calculate the start frame value.
 	 */
-	xhci_interval = EP_INTERVAL_TO_UFRAMES(le32_to_cpu(ep_ctx->ep_info));
-	ep_interval = urb->interval;
-	/* Convert to microframes */
-	if (urb->dev->speed == USB_SPEED_LOW ||
-			urb->dev->speed == USB_SPEED_FULL)
-		ep_interval *= 8;
-	/* FIXME change this to a warning and a suggestion to use the new API
-	 * to set the polling interval (once the API is added).
-	 */
-	if (xhci_interval != ep_interval) {
-		dev_dbg_ratelimited(&urb->dev->dev,
-				"Driver uses different interval (%d microframe%s) than xHCI (%d microframe%s)\n",
-				ep_interval, ep_interval == 1 ? "" : "s",
-				xhci_interval, xhci_interval == 1 ? "" : "s");
-		urb->interval = xhci_interval;
-		/* Convert back to frames for LS/FS devices */
-		if (urb->dev->speed == USB_SPEED_LOW ||
-				urb->dev->speed == USB_SPEED_FULL)
-			urb->interval /= 8;
-	}
+	check_interval(xhci, urb, ep_ctx);
 
 	/* Calculate the start frame and put it in urb->start_frame. */
 	if (HCC_CFC(xhci->hcc_params) && !list_empty(&ep_ring->td_list)) {
